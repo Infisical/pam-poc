@@ -1,4 +1,4 @@
-module github.com/sheensantoscapadngan/ssh-reverse-tunnel
+module github.com/Infisical/pam-poc
 
 go 1.23.0
 
