@@ -6,6 +6,8 @@ services:
     build:
       context: .
       dockerfile: proxy/Dockerfile
+    environment:
+      - PUBLIC_IP=${PUBLIC_IP:-} # Set this to your VM's public IP
     ports:
       - "2222:2222" # SSH server
       - "8081:8081" # HTTP API for certificate generation
@@ -27,7 +29,7 @@ services:
       - AGENT_NAME=web-agent
       - SSH_PORT=2222
       - LOCAL_PORT=8000
-      - DOCKER_ENV=true
+      - SSH_HOST=proxy
     networks:
       - gateway-network
       - proxy-network # Gateway can reach proxy, but proxy can't reach gateway

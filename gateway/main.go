@@ -117,9 +117,9 @@ func connectAndServe() error {
 	}
 
 	// Connect to SSH server
-	sshHost := "proxy" // Use Docker service name when in container
-	if os.Getenv("DOCKER_ENV") == "" {
-		sshHost = "localhost" // Use localhost when running locally
+	sshHost := os.Getenv("SSH_HOST")
+	if sshHost == "" {
+		sshHost = "localhost" // Default to localhost if not specified
 	}
 	log.Printf("Connecting to SSH server on %s:%d...", sshHost, sshPort)
 	client, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), config)

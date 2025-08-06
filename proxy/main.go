@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -85,6 +86,15 @@ func generateTLSCertificates() (*tls.Config, error) {
 		return nil, fmt.Errorf("failed to generate server key: %v", err)
 	}
 
+	// Get public IP from environment variable
+	publicIP := os.Getenv("PUBLIC_IP")
+
+	// Build DNS names list
+	dnsNames := []string{"localhost", "proxy"}
+	if publicIP != "" {
+		dnsNames = append(dnsNames, publicIP)
+	}
+
 	serverTemplate := &x509.Certificate{
 		SerialNumber: big.NewInt(2),
 		Subject: pkix.Name{
@@ -95,7 +105,7 @@ func generateTLSCertificates() (*tls.Config, error) {
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		KeyUsage:    x509.KeyUsageDigitalSignature,
 		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
-		DNSNames:    []string{"localhost", "proxy"},
+		DNSNames:    dnsNames,
 	}
 
 	serverCertDER, err := x509.CreateCertificate(rand.Reader, serverTemplate, caCert, &serverKey.PublicKey, caKey)
@@ -151,7 +161,7 @@ func main() {
 	log.Printf("CA Public Key: %s", string(ssh.MarshalAuthorizedKey(caSigner.PublicKey())))
 
 	// Generate server certificate instead of raw host key
-	hostSigner := generateServerCertificate(caSigner)
+	hostSigner := generateSSHServerCertificate(caSigner)
 	log.Printf("Server authenticated with CA-signed certificate")
 
 	// Generate TLS certificates for mTLS
@@ -262,17 +272,26 @@ func validateCertificate(cert *ssh.Certificate, username string) error {
 	return nil
 }
 
-func generateServerCertificate(ca ssh.Signer) ssh.Signer {
+func generateSSHServerCertificate(ca ssh.Signer) ssh.Signer {
 	// Generate server key pair
 	serverKey, _ := rsa.GenerateKey(rand.Reader, 2048)
 	serverPub, _ := ssh.NewPublicKey(&serverKey.PublicKey)
+
+	// Get public IP from environment variable
+	publicIP := os.Getenv("PUBLIC_IP")
+
+	// Build valid principals list for SSH server certificate
+	validPrincipals := []string{"localhost", "127.0.0.1", "proxy"}
+	if publicIP != "" {
+		validPrincipals = append(validPrincipals, publicIP)
+	}
 
 	// Create server certificate template
 	template := &ssh.Certificate{
 		Key:             serverPub,
 		CertType:        ssh.HostCert, // Host certificate (not user cert)
 		KeyId:           "ssh-tunnel-server",
-		ValidPrincipals: []string{"localhost", "127.0.0.1", "proxy"}, // Server hostnames
+		ValidPrincipals: validPrincipals, // Server hostnames
 		ValidAfter:      uint64(time.Now().Unix()),
 		ValidBefore:     uint64(time.Now().Add(365 * 24 * time.Hour).Unix()), // Valid for 1 year
 	}
