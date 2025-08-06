@@ -391,7 +391,7 @@ func createSSHConfig(privateKeyPEM, certificatePEM []byte) (*ssh.ClientConfig, e
 		return nil, fmt.Errorf("failed to create certificate signer: %v", err)
 	}
 
-	// Create SSH client config
+	// Create SSH client config with explicit algorithm preferences
 	config := &ssh.ClientConfig{
 		User: agentName,
 		Auth: []ssh.AuthMethod{
@@ -399,6 +399,23 @@ func createSSHConfig(privateKeyPEM, certificatePEM []byte) (*ssh.ClientConfig, e
 		},
 		HostKeyCallback: createHostKeyCallback(),
 		Timeout:         30 * time.Second,
+		// Explicitly set algorithm preferences to match server
+		Config: ssh.Config{
+			KeyExchanges: []string{
+				"diffie-hellman-group14-sha256",
+				"diffie-hellman-group16-sha512",
+				"diffie-hellman-group18-sha512",
+			},
+			Ciphers: []string{
+				"aes128-ctr",
+				"aes192-ctr",
+				"aes256-ctr",
+			},
+			MACs: []string{
+				"hmac-sha2-256",
+				"hmac-sha2-512",
+			},
+		},
 	}
 
 	return config, nil
