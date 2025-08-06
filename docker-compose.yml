@@ -9,7 +9,7 @@ services:
     ports:
       - "2222:2222" # SSH server
       - "8081:8081" # HTTP API for certificate generation
-      - "8080:8080" # HTTP API for certificate generation
+      - "8080:8080" # For TCP traffic
     networks:
       - proxy-network
     profiles:
@@ -22,8 +22,6 @@ services:
     build:
       context: .
       dockerfile: gateway/Dockerfile
-    depends_on:
-      - proxy
     environment:
       - SERVER_URL=http://proxy:8081
       - AGENT_NAME=web-agent
@@ -40,36 +38,8 @@ services:
     cap_add:
       - NET_ADMIN # Required for iptables
 
-  gateway-1:
-    build:
-      context: .
-      dockerfile: gateway/Dockerfile
-    depends_on:
-      - proxy
-    environment:
-      - SERVER_URL=http://proxy:8081
-      - AGENT_NAME=web-agent-1
-      - SSH_PORT=2222
-      - LOCAL_PORT=8000
-      - DOCKER_ENV=true
-    networks:
-      - gateway-network
-      - proxy-network # Gateway can reach proxy, but proxy can't reach gateway
-    profiles:
-      - gateway-only
-      - full
-    # Use iptables to block incoming connections from proxy
-    cap_add:
-      - NET_ADMIN # Required for iptables
-
-  # Note: Client runs locally on your machine, not in Docker
-  # Use: go run ./client/main.go
-
 networks:
   proxy-network:
     driver: bridge
-    # Network where gateway can reach proxy but proxy can't reach gateway
   gateway-network:
     driver: bridge
-    internal: true # No external connectivity
-    # Gateway's private network
