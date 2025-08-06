@@ -12,6 +12,9 @@ services:
       - "8080:8080" # HTTP API for certificate generation
     networks:
       - proxy-network
+    profiles:
+      - proxy-only
+      - full
     # Proxy only listens for connections, doesn't initiate them
     # It cannot reach the gateway directly
 
@@ -30,6 +33,9 @@ services:
     networks:
       - gateway-network
       - proxy-network # Gateway can reach proxy, but proxy can't reach gateway
+    profiles:
+      - gateway-only
+      - full
     # Use iptables to block incoming connections from proxy
     cap_add:
       - NET_ADMIN # Required for iptables
@@ -49,6 +55,9 @@ services:
     networks:
       - gateway-network
       - proxy-network # Gateway can reach proxy, but proxy can't reach gateway
+    profiles:
+      - gateway-only
+      - full
     # Use iptables to block incoming connections from proxy
     cap_add:
       - NET_ADMIN # Required for iptables
