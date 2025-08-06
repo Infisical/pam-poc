@@ -66,12 +66,13 @@ func init() {
 		sshHost = "localhost" // Default to localhost if not specified
 	}
 
-	log.Printf("Environment variables initialized:")
-	log.Printf("  SERVER_URL: %s", serverURL)
-	log.Printf("  AGENT_NAME: %s", agentName)
-	log.Printf("  SSH_PORT: %d", sshPort)
-	log.Printf("  LOCAL_PORT: %d", localPort)
-	log.Printf("  SSH_HOST: %s", sshHost)
+	// Use fmt.Println for immediate output in Docker containers
+	fmt.Println("Environment variables initialized:")
+	fmt.Printf("  SERVER_URL: %s\n", serverURL)
+	fmt.Printf("  AGENT_NAME: %s\n", agentName)
+	fmt.Printf("  SSH_PORT: %d\n", sshPort)
+	fmt.Printf("  LOCAL_PORT: %d\n", localPort)
+	fmt.Printf("  SSH_HOST: %s\n", sshHost)
 }
 
 func main() {

@@ -15,23 +15,23 @@ help:
 
 # Start proxy service only
 proxy:
-	docker compose build --no-cache
-	docker compose --profile proxy-only up -d
+	docker compose build --no-cache --pull
+	docker compose --profile proxy-only up -d --force-recreate
 
 # Start gateway services only (requires proxy to be running)
 gateway:
-	docker compose build --no-cache
-	docker compose --profile gateway-only up -d
+	docker compose build --no-cache --pull
+	docker compose --profile gateway-only up -d --force-recreate
 
 # Start all services (proxy + gateways)
 full:
-	docker compose build --no-cache
-	docker compose --profile full up -d
+	docker compose build --no-cache --pull
+	docker compose --profile full up -d --force-recreate
 
 # Rebuild and start all services (same as full)
 up-fresh:
-	docker compose build --no-cache
-	docker compose --profile full up -d
+	docker compose build --no-cache --pull
+	docker compose --profile full up -d --force-recreate
 
 # Stop all services
 down:
