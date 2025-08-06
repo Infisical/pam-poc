@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
@@ -103,10 +104,10 @@ func establishTunnel() error {
 }
 
 func connectAndServe() error {
-	// Fetch certificate from server
-	privateKey, certificate, err := fetchCertificate()
+	// Fetch SSH certificate from server
+	privateKey, certificate, err := fetchSSHCertificate()
 	if err != nil {
-		return fmt.Errorf("failed to fetch certificate: %v", err)
+		return fmt.Errorf("failed to fetch SSH certificate: %v", err)
 	}
 
 	// Create SSH client config
@@ -177,6 +178,29 @@ func handleIncomingChannel(newChannel ssh.NewChannel) {
 	target := fmt.Sprintf("%s:%d", req.Host, req.Port)
 	log.Printf("Creating TCP tunnel to: %s", target)
 
+	// Create mTLS server configuration
+	tlsConfig, err := createMTLSConfig()
+	if err != nil {
+		log.Printf("Failed to create mTLS config: %v", err)
+		return
+	}
+
+	// Create a virtual connection that pipes data between SSH channel and TLS
+	virtualConn := &virtualConnection{
+		channel: channel,
+	}
+
+	// Wrap the virtual connection with TLS
+	tlsConn := tls.Server(virtualConn, tlsConfig)
+
+	// Perform TLS handshake
+	if err := tlsConn.Handshake(); err != nil {
+		log.Printf("TLS handshake failed: %v", err)
+		return
+	}
+
+	log.Printf("mTLS connection established with client: %s", tlsConn.ConnectionState().ServerName)
+
 	// Connect to local service
 	localConn, err := net.Dial("tcp", target)
 	if err != nil {
@@ -187,27 +211,26 @@ func handleIncomingChannel(newChannel ssh.NewChannel) {
 
 	log.Printf("TCP tunnel established to %s", target)
 
-	// Create bidirectional TCP tunnel
-	// Forward data from SSH channel to local service
+	// Create bidirectional tunnel with TLS
+	// Forward data from TLS connection to local service
 	go func() {
-		io.Copy(localConn, channel)
+		io.Copy(localConn, tlsConn)
 		localConn.Close()
-		log.Printf("SSH channel -> local service tunnel closed")
+		log.Printf("TLS -> local service tunnel closed")
 	}()
 
-	// Forward data from local service to SSH channel
-	fmt.Println("Forwarding data from local service to SSH channel")
-	io.Copy(channel, localConn)
-	log.Printf("Local service -> SSH channel tunnel closed")
+	// Forward data from local service to TLS connection
+	io.Copy(tlsConn, localConn)
+	log.Printf("Local service -> TLS tunnel closed")
 }
 
 // Keep all the existing certificate and SSH config functions unchanged
-func fetchCertificate() ([]byte, []byte, error) {
-	log.Printf("Fetching certificate from %s/generate-cert?agent=%s", serverURL, agentName)
+func fetchSSHCertificate() ([]byte, []byte, error) {
+	log.Printf("Fetching SSH certificate from %s/generate-cert?agent=%s", serverURL, agentName)
 
 	resp, err := http.Post(fmt.Sprintf("%s/generate-cert?agent=%s", serverURL, agentName), "application/json", nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to fetch certificate: %v", err)
+		return nil, nil, fmt.Errorf("failed to fetch SSH certificate: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -223,10 +246,10 @@ func fetchCertificate() ([]byte, []byte, error) {
 	// Parse the response to extract private key and certificate
 	privateKey, certificate, err := parseCertificateResponse(string(body))
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse certificate response: %v", err)
+		return nil, nil, fmt.Errorf("failed to parse SSH certificate response: %v", err)
 	}
 
-	log.Printf("Successfully fetched certificate for agent: %s", agentName)
+	log.Printf("Successfully fetched SSH certificate for agent: %s", agentName)
 	return privateKey, certificate, nil
 }
 
@@ -284,6 +307,58 @@ func parseCertificateResponse(response string) ([]byte, []byte, error) {
 	}
 
 	return []byte(privateKeyPEM), []byte(certLines[0]), nil
+}
+
+// parseTLSCertificateResponse parses TLS certificate response from proxy
+func parseTLSCertificateResponse(response string) ([]byte, []byte, error) {
+	lines := strings.Split(response, "\n")
+	var privateKeyLines, certLines []string
+	var inPrivateKey, inCert bool
+
+	for _, line := range lines {
+		// Check for section markers
+		if strings.TrimSpace(line) == "PRIVATE_KEY:" {
+			inPrivateKey = true
+			inCert = false
+			continue
+		}
+		if strings.TrimSpace(line) == "CERTIFICATE:" {
+			inPrivateKey = false
+			inCert = true
+			continue
+		}
+
+		// Collect private key lines (including the BEGIN/END markers)
+		if inPrivateKey && strings.TrimSpace(line) != "" {
+			privateKeyLines = append(privateKeyLines, line)
+		}
+
+		// Collect certificate lines (including the BEGIN/END markers)
+		if inCert && strings.TrimSpace(line) != "" {
+			certLines = append(certLines, line)
+		}
+	}
+
+	if len(privateKeyLines) == 0 {
+		return nil, nil, fmt.Errorf("no private key found in response")
+	}
+	if len(certLines) == 0 {
+		return nil, nil, fmt.Errorf("no certificate found in response")
+	}
+
+	// Reconstruct the private key PEM block
+	privateKeyPEM := strings.Join(privateKeyLines, "\n")
+	if !strings.HasSuffix(privateKeyPEM, "\n") {
+		privateKeyPEM += "\n"
+	}
+
+	// Reconstruct the certificate PEM block
+	certPEM := strings.Join(certLines, "\n")
+	if !strings.HasSuffix(certPEM, "\n") {
+		certPEM += "\n"
+	}
+
+	return []byte(privateKeyPEM), []byte(certPEM), nil
 }
 
 func createSSHConfig(privateKeyPEM, certificatePEM []byte) (*ssh.ClientConfig, error) {
@@ -517,8 +592,8 @@ func testSFTPAccess() {
 }
 
 func getTestSigner() ssh.Signer {
-	// Fetch certificate for testing
-	privateKey, certificate, err := fetchCertificate()
+	// Fetch SSH certificate for testing
+	privateKey, certificate, err := fetchSSHCertificate()
 	if err != nil {
 		log.Printf("    ❌ Security test setup failed: %v", err)
 		return nil
@@ -565,4 +640,113 @@ func getTestSigner() ssh.Signer {
 	}
 
 	return certSigner
+}
+
+// virtualConnection implements net.Conn to bridge SSH channel and TLS
+type virtualConnection struct {
+	channel ssh.Channel
+}
+
+func (vc *virtualConnection) Read(b []byte) (n int, err error) {
+	return vc.channel.Read(b)
+}
+
+func (vc *virtualConnection) Write(b []byte) (n int, err error) {
+	return vc.channel.Write(b)
+}
+
+func (vc *virtualConnection) Close() error {
+	return vc.channel.Close()
+}
+
+func (vc *virtualConnection) LocalAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+}
+
+func (vc *virtualConnection) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+}
+
+func (vc *virtualConnection) SetDeadline(t time.Time) error {
+	return nil
+}
+
+func (vc *virtualConnection) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+func (vc *virtualConnection) SetWriteDeadline(t time.Time) error {
+	return nil
+}
+
+// createMTLSConfig creates TLS configuration for mTLS server
+func createMTLSConfig() (*tls.Config, error) {
+	// Fetch server certificate from proxy
+	serverCert, serverKey, err := fetchServerCertificate()
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch server certificate: %v", err)
+	}
+
+	// Fetch CA certificate for client validation
+	caCert, err := fetchCACertificate()
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch CA certificate: %v", err)
+	}
+
+	// Parse server certificate
+	cert, err := tls.X509KeyPair(serverCert, serverKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse server certificate: %v", err)
+	}
+
+	// Parse CA certificate
+	caCertPool := x509.NewCertPool()
+	if !caCertPool.AppendCertsFromPEM(caCert) {
+		return nil, fmt.Errorf("failed to parse CA certificate")
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientCAs:    caCertPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
+// fetchServerCertificate fetches server certificate from proxy
+func fetchServerCertificate() ([]byte, []byte, error) {
+	resp, err := http.Post(fmt.Sprintf("%s/generate-server-cert", serverURL), "application/json", nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to fetch server certificate: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read response: %v", err)
+	}
+
+	// Parse the response to extract private key and certificate
+	privateKey, certificate, err := parseTLSCertificateResponse(string(body))
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to parse TLS certificate response: %v", err)
+	}
+
+	return certificate, privateKey, nil
+}
+
+// fetchCACertificate fetches CA certificate from proxy
+func fetchCACertificate() ([]byte, error) {
+	resp, err := http.Get(fmt.Sprintf("%s/tls-ca-cert", serverURL))
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch CA certificate: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read CA certificate: %v", err)
+	}
+
+	return body, nil
 }

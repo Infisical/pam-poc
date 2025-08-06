@@ -101,6 +101,161 @@ func fetchCertificates(serverAddr string) (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
+// fetchGatewayCertificates gets client certificates for gateway mTLS
+func fetchGatewayCertificates(serverAddr, agentName string) (*tls.Config, error) {
+	// Fetch client certificate from proxy
+	resp, err := http.Post(fmt.Sprintf("http://%s/generate-client-cert?agent=%s", serverAddr, agentName), "application/json", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch client certificate: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %v", err)
+	}
+
+	// Parse the response to extract private key and certificate
+	privateKey, certificate, err := parseCertificateResponse(string(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate response: %v", err)
+	}
+
+	// Parse private key
+	keyBlock, _ := pem.Decode(privateKey)
+	if keyBlock == nil {
+		return nil, fmt.Errorf("failed to decode private key")
+	}
+
+	clientKey, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %v", err)
+	}
+
+	// Parse certificate
+	certBlock, _ := pem.Decode(certificate)
+	if certBlock == nil {
+		return nil, fmt.Errorf("failed to decode certificate")
+	}
+
+	_, err = x509.ParseCertificate(certBlock.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate: %v", err)
+	}
+
+	// Fetch CA certificate for gateway validation
+	caResp, err := http.Get(fmt.Sprintf("http://%s/tls-ca-cert", serverAddr))
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch CA certificate: %v", err)
+	}
+	defer caResp.Body.Close()
+
+	caPEM, err := io.ReadAll(caResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read CA certificate: %v", err)
+	}
+
+	caBlock, _ := pem.Decode(caPEM)
+	if caBlock == nil {
+		return nil, fmt.Errorf("failed to decode CA certificate")
+	}
+
+	caCert, err := x509.ParseCertificate(caBlock.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse CA certificate: %v", err)
+	}
+
+	// Create TLS config for gateway
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{
+			{
+				Certificate: [][]byte{certBlock.Bytes},
+				PrivateKey:  clientKey,
+			},
+		},
+		RootCAs:    x509.NewCertPool(),
+		ServerName: "gateway-server",
+	}
+
+	// Add CA for gateway validation
+	tlsConfig.RootCAs.AddCert(caCert)
+
+	log.Printf("Generated gateway client certificates for mTLS")
+	return tlsConfig, nil
+}
+
+// parseCertificateResponse parses the certificate response from proxy
+func parseCertificateResponse(response string) ([]byte, []byte, error) {
+	lines := strings.Split(response, "\n")
+	var privateKeyLines, certLines []string
+	var inPrivateKey, inCert bool
+
+	for _, line := range lines {
+		// Check for section markers
+		if strings.TrimSpace(line) == "PRIVATE_KEY:" {
+			inPrivateKey = true
+			inCert = false
+			continue
+		}
+		if strings.TrimSpace(line) == "CERTIFICATE:" {
+			inPrivateKey = false
+			inCert = true
+			continue
+		}
+
+		// Add lines to appropriate section
+		if inPrivateKey && strings.TrimSpace(line) != "" {
+			privateKeyLines = append(privateKeyLines, line)
+		}
+		if inCert && strings.TrimSpace(line) != "" {
+			certLines = append(certLines, line)
+		}
+	}
+
+	// Convert to PEM format
+	privateKeyPEM := []byte(strings.Join(privateKeyLines, "\n") + "\n")
+	certPEM := []byte(strings.Join(certLines, "\n") + "\n")
+
+	return privateKeyPEM, certPEM, nil
+}
+
+// virtualRelayConnection implements net.Conn to bridge proxy connection and TLS client
+type virtualRelayConnection struct {
+	conn net.Conn
+}
+
+func (vrc *virtualRelayConnection) Read(b []byte) (n int, err error) {
+	return vrc.conn.Read(b)
+}
+
+func (vrc *virtualRelayConnection) Write(b []byte) (n int, err error) {
+	return vrc.conn.Write(b)
+}
+
+func (vrc *virtualRelayConnection) Close() error {
+	return vrc.conn.Close()
+}
+
+func (vrc *virtualRelayConnection) LocalAddr() net.Addr {
+	return vrc.conn.LocalAddr()
+}
+
+func (vrc *virtualRelayConnection) RemoteAddr() net.Addr {
+	return vrc.conn.RemoteAddr()
+}
+
+func (vrc *virtualRelayConnection) SetDeadline(t time.Time) error {
+	return vrc.conn.SetDeadline(t)
+}
+
+func (vrc *virtualRelayConnection) SetReadDeadline(t time.Time) error {
+	return vrc.conn.SetReadDeadline(t)
+}
+
+func (vrc *virtualRelayConnection) SetWriteDeadline(t time.Time) error {
+	return vrc.conn.SetWriteDeadline(t)
+}
+
 func main() {
 	// Default values
 	agentName := "web-agent"
@@ -118,15 +273,21 @@ func main() {
 		managementServer = os.Args[3]
 	}
 
-	// Fetch TLS certificates from server
-	tlsConfig, err := fetchCertificates(managementServer)
+	// Fetch TLS certificates for proxy relay
+	proxyTLSConfig, err := fetchCertificates(managementServer)
 	if err != nil {
-		log.Fatalf("Failed to fetch certificates: %v", err)
+		log.Fatalf("Failed to fetch proxy certificates: %v", err)
+	}
+
+	// Fetch TLS certificates for gateway mTLS
+	gatewayTLSConfig, err := fetchGatewayCertificates(managementServer, agentName)
+	if err != nil {
+		log.Fatalf("Failed to fetch gateway certificates: %v", err)
 	}
 
 	// Start HTTP proxy server
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handleHTTPRequest(w, r, agentName, tunnelServer, tlsConfig)
+		handleHTTPRequest(w, r, agentName, tunnelServer, proxyTLSConfig, gatewayTLSConfig)
 	})
 
 	log.Printf("HTTP proxy listening on :8082")
@@ -136,46 +297,67 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8082", nil))
 }
 
-func handleHTTPRequest(w http.ResponseWriter, r *http.Request, agentName, tunnelServer string, tlsConfig *tls.Config) {
+func handleHTTPRequest(w http.ResponseWriter, r *http.Request, agentName, tunnelServer string, proxyTLSConfig, gatewayTLSConfig *tls.Config) {
 	log.Printf("Proxying request: %s %s", r.Method, r.URL.Path)
-	log.Printf("TLS config has %d certificates", len(tlsConfig.Certificates))
 
-	// Connect to tunnel server with TLS
-	conn, err := tls.Dial("tcp", tunnelServer, tlsConfig)
+	// Stage 1: Connect to proxy relay with TLS
+	log.Printf("Stage 1: Establishing TLS connection to proxy relay...")
+	proxyConn, err := tls.Dial("tcp", tunnelServer, proxyTLSConfig)
 	if err != nil {
-		log.Printf("Failed to connect to tunnel server: %v", err)
-		http.Error(w, "Failed to connect to tunnel", http.StatusServiceUnavailable)
+		log.Printf("Failed to connect to proxy relay: %v", err)
+		http.Error(w, "Failed to connect to proxy relay", http.StatusServiceUnavailable)
 		return
 	}
-	defer conn.Close()
+	defer proxyConn.Close()
 
-	log.Printf("TLS connection established successfully")
-	log.Printf("TLS version: %d", conn.ConnectionState().Version)
-	log.Printf("TLS cipher suite: %d", conn.ConnectionState().CipherSuite)
+	log.Printf("Proxy relay TLS connection established successfully")
+	log.Printf("TLS version: %d", proxyConn.ConnectionState().Version)
+	log.Printf("TLS cipher suite: %d", proxyConn.ConnectionState().CipherSuite)
 
-	// Send agent name followed by newline
-	conn.Write([]byte(agentName + "\n"))
+	// Send agent name to proxy
+	proxyConn.Write([]byte(agentName + "\n"))
+	log.Printf("Sent agent name: %s", agentName)
+
+	// Stage 2: Establish mTLS connection to gateway through the relay
+	log.Printf("Stage 2: Establishing mTLS connection to gateway...")
+
+	// Create a virtual connection that pipes through the proxy relay
+	virtualConn := &virtualRelayConnection{
+		conn: proxyConn,
+	}
+
+	// Establish mTLS with gateway
+	gatewayConn := tls.Client(virtualConn, gatewayTLSConfig)
+	if err := gatewayConn.Handshake(); err != nil {
+		log.Printf("Failed to establish mTLS with gateway: %v", err)
+		http.Error(w, "Failed to establish mTLS with gateway", http.StatusServiceUnavailable)
+		return
+	}
+
+	log.Printf("Gateway mTLS connection established successfully")
+	log.Printf("Gateway TLS version: %d", gatewayConn.ConnectionState().Version)
+	log.Printf("Gateway TLS cipher suite: %d", gatewayConn.ConnectionState().CipherSuite)
 
 	// Reconstruct the HTTP request
 	httpRequest := reconstructHTTPRequest(r)
 
-	// Send the HTTP request through the tunnel with logging
-	log.Printf("[CLIENT->TUNNEL] Sending %d bytes: %q", len(httpRequest), string(httpRequest))
-	_, err = conn.Write(httpRequest)
+	// Send the HTTP request through the gateway with logging
+	log.Printf("[CLIENT->GATEWAY] Sending %d bytes: %q", len(httpRequest), string(httpRequest))
+	_, err = gatewayConn.Write(httpRequest)
 	if err != nil {
-		log.Printf("Failed to write to tunnel: %v", err)
-		http.Error(w, "Failed to send request through tunnel", http.StatusInternalServerError)
+		log.Printf("Failed to write to gateway: %v", err)
+		http.Error(w, "Failed to send request to gateway", http.StatusInternalServerError)
 		return
 	}
 
-	// Read complete HTTP response from tunnel
-	response, err := readCompleteHTTPResponse(conn)
+	// Read complete HTTP response from gateway
+	response, err := readCompleteHTTPResponse(gatewayConn)
 	if err != nil {
-		log.Printf("Failed to read response from tunnel: %v", err)
-		http.Error(w, "Failed to read response from tunnel", http.StatusInternalServerError)
+		log.Printf("Failed to read response from gateway: %v", err)
+		http.Error(w, "Failed to read response from gateway", http.StatusInternalServerError)
 		return
 	}
-	log.Printf("[TUNNEL->CLIENT] Received %d bytes: %q", len(response), string(response))
+	log.Printf("[GATEWAY->CLIENT] Received %d bytes: %q", len(response), string(response))
 
 	// Parse and forward the HTTP response
 	forwardHTTPResponse(w, response)

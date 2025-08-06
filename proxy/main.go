@@ -30,6 +30,12 @@ var (
 
 	// TLS CA certificate for client certificates
 	tlsCACert []byte
+
+	// TLS CA private key for signing certificates
+	tlsCAKey *rsa.PrivateKey
+
+	// TLS configuration for client connections
+	tlsConfig *tls.Config
 )
 
 // logWriter implements io.Writer to log packet data
@@ -124,11 +130,12 @@ func generateTLSCertificates() (*tls.Config, error) {
 	// Don't add any CA to ClientCAs - this will make it accept any client certificate
 	// In production, you'd add the client CA here
 
-	// Store TLS CA certificate for client access
+	// Store TLS CA certificate and key for client access
 	tlsCACert = pem.EncodeToMemory(&pem.Block{
 		Type:  "CERTIFICATE",
 		Bytes: caCertDER,
 	})
+	tlsCAKey = caKey
 
 	log.Printf("Generated TLS certificates for mTLS")
 	log.Printf("TLS CA Certificate available at: GET http://localhost:8081/tls-ca-cert")
@@ -223,6 +230,8 @@ func main() {
 	http.HandleFunc("/ca-public-key", serveCAPubKey)
 	http.HandleFunc("/tls-ca-cert", serveTLSCACert)
 	http.HandleFunc("/generate-cert", generateAgentCert)
+	http.HandleFunc("/generate-client-cert", generateClientCert)
+	http.HandleFunc("/generate-server-cert", generateServerCert)
 
 	log.Println("HTTP management server listening on :8081")
 	log.Println("CA management:")
@@ -342,6 +351,143 @@ func generateAgentCert(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "CERTIFICATE:\n%s\n", string(ssh.MarshalAuthorizedKey(template)))
 }
 
+func generateClientCert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	agentName := r.URL.Query().Get("agent")
+	if agentName == "" {
+		http.Error(w, "agent parameter required", http.StatusBadRequest)
+		return
+	}
+
+	// Generate a new key pair for the client
+	clientKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+
+	// Create certificate template
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().Unix()),
+		Subject: pkix.Name{
+			CommonName:   fmt.Sprintf("client-for-%s", agentName),
+			Organization: []string{"SSH Tunnel Client"},
+		},
+		NotBefore:   time.Now(),
+		NotAfter:    time.Now().Add(24 * time.Hour),
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		KeyUsage:    x509.KeyUsageDigitalSignature,
+	}
+
+	// Sign the certificate with our CA
+	// First decode the PEM certificate
+	caCertBlock, _ := pem.Decode(tlsCACert)
+	if caCertBlock == nil {
+		http.Error(w, "Failed to decode CA certificate", http.StatusInternalServerError)
+		return
+	}
+
+	caCert, err := x509.ParseCertificate(caCertBlock.Bytes)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to parse CA certificate: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Use the stored CA key
+	if tlsCAKey == nil {
+		http.Error(w, "CA key not available", http.StatusInternalServerError)
+		return
+	}
+	caKey := tlsCAKey
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, caCert, &clientKey.PublicKey, caKey)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create certificate: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Convert private key to PEM format
+	clientKeyBytes := x509.MarshalPKCS1PrivateKey(clientKey)
+	clientKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: clientKeyBytes,
+	})
+
+	// Return both the private key and certificate
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "PRIVATE_KEY:\n%s\n", string(clientKeyPEM))
+	fmt.Fprintf(w, "CERTIFICATE:\n%s\n", string(pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certDER,
+	})))
+}
+
+func generateServerCert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Generate a new key pair for the server
+	serverKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+
+	// Create certificate template
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().Unix()),
+		Subject: pkix.Name{
+			CommonName:   "gateway-server",
+			Organization: []string{"SSH Tunnel Gateway"},
+		},
+		NotBefore:   time.Now(),
+		NotAfter:    time.Now().Add(24 * time.Hour),
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		KeyUsage:    x509.KeyUsageDigitalSignature,
+		DNSNames:    []string{"localhost", "gateway", "127.0.0.1", "gateway-server"},
+	}
+
+	// Sign the certificate with our CA
+	// First decode the PEM certificate
+	caCertBlock, _ := pem.Decode(tlsCACert)
+	if caCertBlock == nil {
+		http.Error(w, "Failed to decode CA certificate", http.StatusInternalServerError)
+		return
+	}
+
+	caCert, err := x509.ParseCertificate(caCertBlock.Bytes)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to parse CA certificate: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Use the stored CA key
+	if tlsCAKey == nil {
+		http.Error(w, "CA key not available", http.StatusInternalServerError)
+		return
+	}
+	caKey := tlsCAKey
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, caCert, &serverKey.PublicKey, caKey)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create certificate: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Convert private key to PEM format
+	serverKeyBytes := x509.MarshalPKCS1PrivateKey(serverKey)
+	serverKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: serverKeyBytes,
+	})
+
+	// Return both the private key and certificate
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "PRIVATE_KEY:\n%s\n", string(serverKeyPEM))
+	fmt.Fprintf(w, "CERTIFICATE:\n%s\n", string(pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certDER,
+	})))
+}
+
 func handleAgent(nConn net.Conn, config *ssh.ServerConfig) {
 	defer nConn.Close()
 
@@ -398,6 +544,7 @@ func handleClient(clientConn net.Conn) {
 
 	// Find the first newline to separate agent name from data
 	data := buffer[:n]
+	log.Printf("Received %d bytes from client: %q", n, string(data))
 	newlineIndex := bytes.IndexByte(data, '\n')
 
 	var agentName string
@@ -407,6 +554,7 @@ func handleClient(clientConn net.Conn) {
 		// Agent name is everything before the newline
 		agentName = string(data[:newlineIndex])
 		remainingData = data[newlineIndex+1:]
+		log.Printf("Extracted agent name: %s", agentName)
 	} else {
 		// No newline found, assume first 10 bytes are agent name
 		if len(data) < 10 {
@@ -415,6 +563,7 @@ func handleClient(clientConn net.Conn) {
 		}
 		agentName = string(data[:10])
 		remainingData = data[10:]
+		log.Printf("Extracted agent name: %s", agentName)
 	}
 
 	// Get the SSH connection for this agent
