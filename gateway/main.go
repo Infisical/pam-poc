@@ -33,6 +33,7 @@ var (
 	agentName string
 	sshPort   int
 	localPort int
+	sshHost   string
 )
 
 func init() {
@@ -61,6 +62,16 @@ func init() {
 	} else {
 		localPort = 8000
 	}
+	if sshHost = os.Getenv("SSH_HOST"); sshHost == "" {
+		sshHost = "localhost" // Default to localhost if not specified
+	}
+
+	log.Printf("Environment variables initialized:")
+	log.Printf("  SERVER_URL: %s", serverURL)
+	log.Printf("  AGENT_NAME: %s", agentName)
+	log.Printf("  SSH_PORT: %d", sshPort)
+	log.Printf("  LOCAL_PORT: %d", localPort)
+	log.Printf("  SSH_HOST: %s", sshHost)
 }
 
 func main() {
@@ -117,10 +128,6 @@ func connectAndServe() error {
 	}
 
 	// Connect to SSH server
-	sshHost := os.Getenv("SSH_HOST")
-	if sshHost == "" {
-		sshHost = "localhost" // Default to localhost if not specified
-	}
 	log.Printf("Connecting to SSH server on %s:%d...", sshHost, sshPort)
 	client, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), config)
 	if err != nil {
