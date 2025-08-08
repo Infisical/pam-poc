@@ -256,11 +256,77 @@ func (vrc *virtualRelayConnection) SetWriteDeadline(t time.Time) error {
 	return vrc.conn.SetWriteDeadline(t)
 }
 
+// TCP forwarder for RDP testing
+func startTCPForwarder(agentName, tunnelServer string, proxyTLSConfig, gatewayTLSConfig *tls.Config) {
+	listener, err := net.Listen("tcp", ":3389") // RDP default port
+	if err != nil {
+		log.Fatalf("Failed to start TCP forwarder: %v", err)
+	}
+	defer listener.Close()
+
+	log.Printf("TCP forwarder listening on :3389 (RDP port)")
+	log.Printf("Connect your RDP client to localhost:3389")
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("Failed to accept TCP connection: %v", err)
+			continue
+		}
+
+		go handleTCPConnection(conn, agentName, tunnelServer, proxyTLSConfig, gatewayTLSConfig)
+	}
+}
+
+func handleTCPConnection(clientConn net.Conn, agentName, tunnelServer string, proxyTLSConfig, gatewayTLSConfig *tls.Config) {
+	defer clientConn.Close()
+
+	log.Printf("TCP connection from %s", clientConn.RemoteAddr())
+
+	// Stage 1: Connect to proxy relay with TLS
+	proxyConn, err := tls.Dial("tcp", tunnelServer, proxyTLSConfig)
+	if err != nil {
+		log.Printf("Failed to connect to proxy relay: %v", err)
+		return
+	}
+	defer proxyConn.Close()
+
+	// Send agent name, host, and port to proxy in format "agent:host:port\n"
+	// For now, we'll use a default target - in practice, this could be configurable
+	targetHost := "34.143.174.106" // Default target host
+	targetPort := "3389"           // Default target port (RDP)
+
+	agentInfo := fmt.Sprintf("%s:%s:%s\n", agentName, targetHost, targetPort)
+	proxyConn.Write([]byte(agentInfo))
+	log.Printf("Sent agent info: %s", strings.TrimSpace(agentInfo))
+
+	// Stage 2: Establish mTLS connection to gateway through the relay
+	virtualConn := &virtualRelayConnection{
+		conn: proxyConn,
+	}
+
+	gatewayConn := tls.Client(virtualConn, gatewayTLSConfig)
+	if err := gatewayConn.Handshake(); err != nil {
+		log.Printf("Failed to establish mTLS with gateway: %v", err)
+		return
+	}
+
+	log.Printf("TCP tunnel established successfully")
+
+	// Bidirectional data forwarding
+	go func() {
+		io.Copy(gatewayConn, clientConn)
+		gatewayConn.Close()
+	}()
+
+	io.Copy(clientConn, gatewayConn)
+}
+
 func main() {
-	// Default values
+	hostName := "localhost"
 	agentName := "web-agent"
-	tunnelServer := "localhost:8080"
-	managementServer := "localhost:8081"
+	tunnelServer := hostName + ":8080"
+	managementServer := hostName + ":8081"
 
 	// Override with command line args if provided
 	if len(os.Args) >= 2 {
@@ -290,9 +356,14 @@ func main() {
 		handleHTTPRequest(w, r, agentName, tunnelServer, proxyTLSConfig, gatewayTLSConfig)
 	})
 
+	// Start TCP forwarder in a goroutine
+	go startTCPForwarder(agentName, tunnelServer, proxyTLSConfig, gatewayTLSConfig)
+
 	log.Printf("HTTP proxy listening on :8082")
+	log.Printf("TCP forwarder listening on :3389 (RDP)")
 	log.Printf("Forwarding requests to agent: %s via TLS tunnel: %s", agentName, tunnelServer)
 	log.Printf("Use: curl http://localhost:8082/your/path")
+	log.Printf("Use: Connect RDP client to localhost:3389")
 	log.Printf("Optional: go run . <agent-name> <tunnel-server:port> <management-server:port>")
 	log.Fatal(http.ListenAndServe(":8082", nil))
 }
@@ -314,9 +385,14 @@ func handleHTTPRequest(w http.ResponseWriter, r *http.Request, agentName, tunnel
 	log.Printf("TLS version: %d", proxyConn.ConnectionState().Version)
 	log.Printf("TLS cipher suite: %d", proxyConn.ConnectionState().CipherSuite)
 
-	// Send agent name to proxy
-	proxyConn.Write([]byte(agentName + "\n"))
-	log.Printf("Sent agent name: %s", agentName)
+	// Send agent name, host, and port to proxy in format "agent:host:port\n"
+	// For HTTP requests, we'll use a default target - in practice, this could be configurable
+	targetHost := "localhost" // Default target host
+	targetPort := "8000"      // Default target port (HTTP)
+
+	agentInfo := fmt.Sprintf("%s:%s:%s\n", agentName, targetHost, targetPort)
+	proxyConn.Write([]byte(agentInfo))
+	log.Printf("Sent agent info: %s", strings.TrimSpace(agentInfo))
 
 	// Stage 2: Establish mTLS connection to gateway through the relay
 	log.Printf("Stage 2: Establishing mTLS connection to gateway...")

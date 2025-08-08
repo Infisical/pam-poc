@@ -15,6 +15,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -553,7 +555,7 @@ func handleClient(clientConn net.Conn) {
 	log.Printf("Client connected from %s", clientConn.RemoteAddr())
 
 	// Read the first few bytes to determine which agent to connect to
-	// Format: "agent1\n" or just "agent1" followed by data
+	// Format: "agent1:host:port\n" or "agent1:host:port" followed by data
 	buffer := make([]byte, 1024)
 	n, err := clientConn.Read(buffer)
 	if err != nil {
@@ -561,28 +563,65 @@ func handleClient(clientConn net.Conn) {
 		return
 	}
 
-	// Find the first newline to separate agent name from data
+	// Find the first newline to separate agent info from data
 	data := buffer[:n]
 	log.Printf("Received %d bytes from client: %q", n, string(data))
 	newlineIndex := bytes.IndexByte(data, '\n')
 
-	var agentName string
+	var agentName, targetHost string
+	var targetPort uint32
 	var remainingData []byte
 
 	if newlineIndex != -1 {
-		// Agent name is everything before the newline
-		agentName = string(data[:newlineIndex])
+		// Agent info is everything before the newline
+		agentInfo := string(data[:newlineIndex])
 		remainingData = data[newlineIndex+1:]
-		log.Printf("Extracted agent name: %s", agentName)
-	} else {
-		// No newline found, assume first 10 bytes are agent name
-		if len(data) < 10 {
-			log.Printf("Invalid client data format")
+
+		// Parse agent info in format "agent:host:port"
+		parts := strings.Split(agentInfo, ":")
+		if len(parts) != 3 {
+			log.Printf("Invalid client data format, expected 'agent:host:port', got: %s", agentInfo)
+			clientConn.Write([]byte("ERROR: Invalid format. Expected 'agent:host:port'\n"))
 			return
 		}
-		agentName = string(data[:10])
-		remainingData = data[10:]
-		log.Printf("Extracted agent name: %s", agentName)
+
+		agentName = parts[0]
+		targetHost = parts[1]
+		portStr := parts[2]
+
+		// Parse port number
+		port, err := strconv.ParseUint(portStr, 10, 32)
+		if err != nil {
+			log.Printf("Invalid port number: %s", portStr)
+			clientConn.Write([]byte("ERROR: Invalid port number\n"))
+			return
+		}
+		targetPort = uint32(port)
+
+		log.Printf("Extracted agent: %s, target: %s:%d", agentName, targetHost, targetPort)
+	} else {
+		// No newline found, try to parse from first 50 bytes
+		if len(data) < 20 {
+			log.Printf("Invalid client data format - too short")
+			clientConn.Write([]byte("ERROR: Invalid format. Expected 'agent:host:port'\n"))
+			return
+		}
+
+		// Try to find the first colon to determine if it's the new format
+		colonIndex := bytes.IndexByte(data[:50], ':')
+		if colonIndex == -1 {
+			log.Printf("Invalid client data format - no colon found")
+			clientConn.Write([]byte("ERROR: Invalid format. Expected 'agent:host:port'\n"))
+			return
+		}
+
+		// Parse the agent info from the beginning
+		remainingData = data[colonIndex+1:]
+
+		// This is a simplified fallback - in practice you might want to read more data
+		log.Printf("Fallback parsing not fully implemented for this format")
+		clientConn.Write([]byte("ERROR: Please use format 'agent:host:port'\n"))
+		return
 	}
 
 	// Get the SSH connection for this agent
@@ -604,7 +643,7 @@ func handleClient(clientConn net.Conn) {
 		Port uint32
 		_    string
 		_    uint32
-	}{"localhost", 8000, "", 0} // Connect to agent's local port 8000
+	}{targetHost, targetPort, "", 0} // Connect to client-specified host and port
 
 	channel, _, err := conn.OpenChannel("direct-tcpip", ssh.Marshal(&payload))
 	if err != nil {
